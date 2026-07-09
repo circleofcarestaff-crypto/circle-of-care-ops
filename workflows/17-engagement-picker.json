@@ -1,0 +1,66 @@
+{
+  "name": "Circle of Care - 17 - Engagement Picker",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 9 * * *" }] } },
+      "id": "17000001-0000-4000-8000-000000000001",
+      "name": "Daily 9AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1400, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-project dedup against THIS project's own engagement_log.json --\n// never a shared cross-project file (C2). Plus a 7-day GLOBAL coherence\n// window against a separate, deliberately shared file -- so the same\n// person doesn't get conflicting drafts from two projects within days,\n// without permanently blocking future engagement (the distinction that\n// matters vs. a permanent suppression file).\n\nconst fs = require('fs');\nconst path = require('path');\nconst crypto = require('crypto');\n\nconst prefix = $json.project_prefix;\nconst contacts = JSON.parse(fs.readFileSync(path.join('Working', prefix, 'contacts.json'), 'utf8')).filter(c => c.valid_format);\n\nlet localLog = [];\ntry { localLog = JSON.parse(fs.readFileSync(path.join('Working', prefix, 'engagement_log.json'), 'utf8')); } catch (e) {}\nconst localSeen = new Set(localLog.map(l => l.email));\n\nlet globalHistory = {};\ntry { globalHistory = JSON.parse(fs.readFileSync(path.join('Shared', 'global_engagement_history.json'), 'utf8')); } catch (e) {}\n\nconst now = Date.now();\nconst SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;\n\nconst eligible = contacts.filter(c => {\n  if (localSeen.has(c.email)) return false;\n  const hash = crypto.createHash('sha256').update(c.email.toLowerCase().trim()).digest('hex');\n  const lastGlobal = globalHistory[hash];\n  if (lastGlobal && (now - new Date(lastGlobal).getTime()) < SEVEN_DAYS_MS) return false;\n  return true;\n});\n\n// Undone rows roll into today ahead of new picks -- local log tracks\n// draft-generated-but-not-yet-posted separately; this simplified pass\n// prioritizes never-yet-drafted contacts first.\nconst picks = eligible.slice(0, 30);\n\nreturn picks.map(c => ({ json: { project_prefix: prefix, ...c } }));\n"
+      },
+      "id": "17000001-0000-4000-8000-000000000002",
+      "name": "Pick 30 (per-project + 7-day global dedup)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1180, 0]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:11434/api/generate",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"qwen2.5:1.5b-instruct-q4_K_M\", stream: false, prompt: \"Write a short LinkedIn engagement note for \" + $json.organization + \". Extend their public point, don't echo it -- offer the next-level angle. No client data, no method reveal.\" }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "17000001-0000-4000-8000-000000000003",
+      "name": "Draft Engagement Note (smaller model)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-960, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\nconst crypto = require('crypto');\n\n// Record locally (per-project) AND update the shared 7-day coherence\n// window -- two different writes, two different purposes.\nconst prefix = $json.project_prefix;\nlet localLog = [];\ntry { localLog = JSON.parse(fs.readFileSync(path.join('Working', prefix, 'engagement_log.json'), 'utf8')); } catch (e) {}\nlocalLog.push({ email: $json.email, drafted_at: new Date().toISOString() });\nfs.writeFileSync(path.join('Working', prefix, 'engagement_log.json'), JSON.stringify(localLog, null, 2), 'utf8');\n\nlet globalHistory = {};\nconst ghPath = path.join('Shared', 'global_engagement_history.json');\ntry { globalHistory = JSON.parse(fs.readFileSync(ghPath, 'utf8')); } catch (e) {}\nconst hash = crypto.createHash('sha256').update($json.email.toLowerCase().trim()).digest('hex');\nglobalHistory[hash] = new Date().toISOString();\nfs.writeFileSync(ghPath, JSON.stringify(globalHistory, null, 2), 'utf8');\n\nreturn [{ json: { ...$json, draft: $json.response } }];\n"
+      },
+      "id": "17000001-0000-4000-8000-000000000004",
+      "name": "Record Local + 7-Day Global Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-740, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Delivered to dashboard \"Today's 30\" panel -- manual post/mark-done.\n// Posting itself stays manual (no compliant automated third-party\n// engagement path exists).\nconst fs = require('fs');\nconst path = require('path');\nlet panel = [];\nconst panelPath = path.join('Shared', 'todays_30.json');\ntry { panel = JSON.parse(fs.readFileSync(panelPath, 'utf8')); } catch (e) {}\npanel.push({ project_prefix: $json.project_prefix, organization: $json.organization, email: $json.email, draft: $json.draft, done: false });\nfs.writeFileSync(panelPath, JSON.stringify(panel, null, 2), 'utf8');\nreturn [{ json: $json }];\n"
+      },
+      "id": "17000001-0000-4000-8000-000000000005",
+      "name": "Push to Today's 30 Panel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-520, 0]
+    }
+  ],
+  "connections": {
+    "Daily 9AM": { "main": [[{ "node": "Pick 30 (per-project + 7-day global dedup)", "type": "main", "index": 0 }]] },
+    "Pick 30 (per-project + 7-day global dedup)": { "main": [[{ "node": "Draft Engagement Note (smaller model)", "type": "main", "index": 0 }]] },
+    "Draft Engagement Note (smaller model)": { "main": [[{ "node": "Record Local + 7-Day Global Window", "type": "main", "index": 0 }]] },
+    "Record Local + 7-Day Global Window": { "main": [[{ "node": "Push to Today's 30 Panel", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

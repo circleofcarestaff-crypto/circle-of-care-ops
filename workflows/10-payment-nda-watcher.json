@@ -1,0 +1,79 @@
+{
+  "name": "Circle of Care - 10 - Payment-NDA Watcher",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "hours", "hoursInterval": 2 }] } },
+      "id": "10000001-0000-4000-8000-000000000001",
+      "name": "Every 2 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1200, 0]
+    },
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "options": { "customEmailConfig": "={{ { seen: false } }}" }
+      },
+      "id": "10000001-0000-4000-8000-000000000002",
+      "name": "IMAP Poll",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [-980, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reference code first, amount as secondary guard -- never amount\n// alone. Both sides normalized (whitespace stripped, uppercased)\n// before comparison so human formatting variance doesn't cause a\n// silent match failure (B1).\n\nconst fs = require('fs');\nconst path = require('path');\n\nfunction normalize(s) { return String(s || '').replace(/\\s+/g, '').toUpperCase(); }\n\nconst bodyText = normalize($json.text || $json.html || '');\nconst refMatch = bodyText.match(/CIRCLEOFCARE-[A-Z0-9]+/);\nconst amountMatch = ($json.text || '').match(/\\$[\\d,]+(?:\\.\\d{2})?/);\n\nif (!refMatch) return [{ json: { matched: false, reason: 'no_reference_code_found' } }];\n\nlet pending = [];\ntry { pending = JSON.parse(fs.readFileSync(path.join('Shared', 'intake_log.json'), 'utf8')); } catch (e) {}\n\nconst candidate = pending.find(p => normalize(p.reference_code) === refMatch[0] && p.status === 'order_confirmed');\nif (!candidate) return [{ json: { matched: false, reason: 'no_pending_order_for_reference' } }];\n\n// Amount as guard, not primary\nif (amountMatch) {\n  const paidAmount = amountMatch[0].replace(/[$,]/g, '');\n  if (parseFloat(paidAmount).toFixed(2) !== parseFloat(candidate.amount).toFixed(2)) {\n    return [{ json: { matched: false, reason: 'amount_mismatch_guard_failed', reference: refMatch[0] } }];\n  }\n}\n\n// Skip already-active/pending codes to prevent duplicate token runs.\nif (candidate.status === 'payment_confirmed') {\n  return [{ json: { matched: false, reason: 'already_processed' } }];\n}\n\nreturn [{ json: { matched: true, reference_code: refMatch[0], project_prefix: candidate.project_prefix, contact_hash: candidate.contact_hash } }];\n"
+      },
+      "id": "10000001-0000-4000-8000-000000000003",
+      "name": "Match Reference Code (normalized)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-760, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "10000001-0001-4000-8000-000000000010", "leftValue": "={{ $json.matched }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "10000001-0000-4000-8000-000000000004",
+      "name": "Matched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-540, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\nlet pending = JSON.parse(fs.readFileSync(path.join('Shared', 'intake_log.json'), 'utf8'));\npending = pending.map(p => p.reference_code === $json.reference_code ? { ...p, status: 'payment_confirmed', payment_confirmed_at: new Date().toISOString() } : p);\nfs.writeFileSync(path.join('Shared', 'intake_log.json'), JSON.stringify(pending, null, 2), 'utf8');\nreturn [{ json: $json }];\n"
+      },
+      "id": "10000001-0000-4000-8000-000000000005",
+      "name": "Mark Payment Confirmed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-320, -80]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Scans for abuse/FBL notifications -- separate from payment matching\n// on the same inbox poll (A7).\nconst text = ($json.text || '') + ' ' + ($json.subject || '');\nif (/abuse report|feedback loop|spam complaint/i.test(text)) {\n  const fs = require('fs');\n  const path = require('path');\n  const emailMatch = text.match(/[^\\s@]+@[^\\s@]+\\.[^\\s@]+/);\n  if (emailMatch) {\n    const crypto = require('crypto');\n    const hash = crypto.createHash('sha256').update(emailMatch[0].toLowerCase().trim().replace(/\\+.*@/, '@')).digest('hex');\n    let dnc = [];\n    try { dnc = fs.readFileSync(path.join('Shared', 'global_dnc.txt'), 'utf8').split('\\n').filter(Boolean); } catch (e) {}\n    if (!dnc.includes(hash)) fs.appendFileSync(path.join('Shared', 'global_dnc.txt'), hash + '\\n', 'utf8');\n  }\n}\nreturn [{ json: $json }];\n"
+      },
+      "id": "10000001-0000-4000-8000-000000000006",
+      "name": "Scan for Abuse/FBL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-320, 100]
+    }
+  ],
+  "connections": {
+    "Every 2 Hours": { "main": [[{ "node": "IMAP Poll", "type": "main", "index": 0 }]] },
+    "IMAP Poll": { "main": [[{ "node": "Match Reference Code (normalized)", "type": "main", "index": 0 }, { "node": "Scan for Abuse/FBL", "type": "main", "index": 0 }]] },
+    "Match Reference Code (normalized)": { "main": [[{ "node": "Matched?", "type": "main", "index": 0 }]] },
+    "Matched?": { "main": [[{ "node": "Mark Payment Confirmed", "type": "main", "index": 0 }], []] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

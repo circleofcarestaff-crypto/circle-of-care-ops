@@ -1,0 +1,125 @@
+{
+  "name": "Circle of Care - 16 - Carousel Builder",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "16000001-0000-4000-8000-000000000001",
+      "name": "Start (Deadline Law expiry trigger)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-1200, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One post per day, queue not burst. Checks a queue counter before\n// proceeding -- if already posted today, this project's carousel waits.\nconst fs = require('fs');\nconst path = require('path');\nlet queue = [];\ntry { queue = JSON.parse(fs.readFileSync(path.join('Shared', 'linkedin_queue.json'), 'utf8')); } catch (e) {}\nconst today = new Date().toISOString().slice(0, 10);\nconst postedToday = queue.some(q => q.posted_date === today);\nreturn [{ json: { ...$json, can_post_today: !postedToday } }];\n"
+      },
+      "id": "16000001-0000-4000-8000-000000000002",
+      "name": "Check Daily Cadence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-980, 0]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:11434/api/generate",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"qwen2.5:4b-instruct-q4_K_M\", stream: false, prompt: \"Write a 6-10 slide insight carousel about this expired public solicitation. No client names, no contact data, no invented figures -- every claim must cite the source manifest. Facts: \" + JSON.stringify($json.decoded_facts) }) }}",
+        "options": { "timeout": 180000 }
+      },
+      "id": "16000001-0000-4000-8000-000000000003",
+      "name": "Draft Slide Content (Qwen)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-760, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fixed branded slide template, pdf-lib, no browser, no native deps.\nconst { PDFDocument, rgb } = require('pdf-lib');\nconst fs = require('fs');\nconst path = require('path');\n\nconst templateBytes = fs.readFileSync(path.join('Originals', 'brand_shell', 'carousel_template.pdf'));\nconst pdfDoc = await PDFDocument.load(templateBytes);\n\nconst slides = JSON.parse($json.response || '[]');\nconst pages = pdfDoc.getPages();\nslides.slice(0, pages.length).forEach((text, i) => {\n  pages[i].drawText(String(text).slice(0, 500), { x: 50, y: 400, size: 14, color: rgb(0.05, 0.13, 0.28) });\n});\n\nconst outPath = path.join('Working', $json.project_prefix, 'carousel_output.pdf');\nconst bytes = await pdfDoc.save();\nfs.writeFileSync(outPath, bytes);\n\nreturn [{ json: { ...$json, pdf_path: outPath } }];\n"
+      },
+      "id": "16000001-0000-4000-8000-000000000004",
+      "name": "Render Branded PDF",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-540, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Public-post scan: zero client names, contact hashes, unfilled placeholders.\nconst fs = require('fs');\nconst text = JSON.stringify($json);\nconst hasPlaceholder = /{{.*?}}/.test(text);\nlet contacts = [];\ntry { contacts = JSON.parse(fs.readFileSync(require('path').join('Working', $json.project_prefix, 'contacts.json'), 'utf8')); } catch (e) {}\nconst leaksContactData = contacts.some(c => text.includes(c.email) || (c.organization && text.includes(c.organization)));\nreturn [{ json: { ...$json, scan_passed: !hasPlaceholder && !leaksContactData } }];\n"
+      },
+      "id": "16000001-0000-4000-8000-000000000005",
+      "name": "Public-Post Scan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-320, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "16000001-0001-4000-8000-000000000010", "leftValue": "={{ $json.scan_passed }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "16000001-0000-4000-8000-000000000006",
+      "name": "Scan Passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-100, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// LinkedIn's real multi-step document upload flow: register, transmit,\n// finalize -- never a single inline request assuming it fits one call.\nconst fs = require('fs');\nconst token = fs.readFileSync(require('path').join('Shared', 'linkedin_token.txt'), 'utf8').trim();\n\n// Step 1: register the upload\nconst registerResp = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'https://api.linkedin.com/rest/documents?action=initializeUpload',\n  headers: { Authorization: 'Bearer ' + token },\n  body: { initializeUploadRequest: { owner: 'urn:li:organization:CIRCLEOFCARE' } },\n  json: true\n});\n\n// Step 2: transmit the asset bytes to the returned upload URL\nconst fileBytes = fs.readFileSync($json.pdf_path);\nawait this.helpers.httpRequest({ method: 'PUT', url: registerResp.value.uploadUrl, body: fileBytes });\n\n// Step 3: finalize -- reference the confirmed document URN in the post\nconst postResp = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'https://api.linkedin.com/rest/posts',\n  headers: { Authorization: 'Bearer ' + token },\n  body: { author: 'urn:li:organization:CIRCLEOFCARE', commentary: $json.caption || '', content: { media: { id: registerResp.value.document } } },\n  json: true\n});\n\nreturn [{ json: { ...$json, posted: true, post_urn: postResp.id } }];\n"
+      },
+      "id": "16000001-0000-4000-8000-000000000007",
+      "name": "LinkedIn Multi-Step Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [120, -100],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "16000001-0002-4000-8000-000000000011", "leftValue": "={{ $json.posted }}", "rightValue": true, "operator": { "type": "boolean", "operation": "notEqual" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "16000001-0000-4000-8000-000000000008",
+      "name": "Upload Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [340, -100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback: PDF + ready caption queued on the dashboard for a one-click manual attach.\nconst fs = require('fs');\nconst path = require('path');\nlet queue = [];\nconst qPath = path.join('Shared', 'linkedin_queue.json');\ntry { queue = JSON.parse(fs.readFileSync(qPath, 'utf8')); } catch (e) {}\nqueue.push({ project_prefix: $json.project_prefix, pdf_path: $json.pdf_path, caption: $json.caption || '', queued_at: new Date().toISOString(), posted_date: null, status: 'awaiting_manual_post' });\nfs.writeFileSync(qPath, JSON.stringify(queue, null, 2), 'utf8');\nreturn [{ json: $json }];\n"
+      },
+      "id": "16000001-0000-4000-8000-000000000009",
+      "name": "Dashboard Fallback Queue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, -20]
+    }
+  ],
+  "connections": {
+    "Start (Deadline Law expiry trigger)": { "main": [[{ "node": "Check Daily Cadence", "type": "main", "index": 0 }]] },
+    "Check Daily Cadence": { "main": [[{ "node": "Draft Slide Content (Qwen)", "type": "main", "index": 0 }]] },
+    "Draft Slide Content (Qwen)": { "main": [[{ "node": "Render Branded PDF", "type": "main", "index": 0 }]] },
+    "Render Branded PDF": { "main": [[{ "node": "Public-Post Scan", "type": "main", "index": 0 }]] },
+    "Public-Post Scan": { "main": [[{ "node": "Scan Passed?", "type": "main", "index": 0 }]] },
+    "Scan Passed?": { "main": [[{ "node": "LinkedIn Multi-Step Upload", "type": "main", "index": 0 }], []] },
+    "LinkedIn Multi-Step Upload": { "main": [[{ "node": "Upload Failed?", "type": "main", "index": 0 }]] },
+    "Upload Failed?": { "main": [[{ "node": "Dashboard Fallback Queue", "type": "main", "index": 0 }], []] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

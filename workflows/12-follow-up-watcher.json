@@ -1,0 +1,53 @@
+{
+  "name": "Circle of Care - 12 - Follow-up Watcher",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "hours", "hoursInterval": 12 }] } },
+      "id": "12000001-0000-4000-8000-000000000001",
+      "name": "Twice Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1000, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Writes exclusively to reminder_log.json -- an isolated, append-only\n// file handler, serialized the same way as the Global DNC engine.\n// NEVER writes state flags into contacts.json/pipeline.json directly,\n// which is exactly what caused the write-lock collision this fixes (B1).\n\nconst fs = require('fs');\nconst path = require('path');\n\nlet intakeLog = [];\ntry { intakeLog = JSON.parse(fs.readFileSync(path.join('Shared', 'intake_log.json'), 'utf8')); } catch (e) {}\n\nlet reminderLog = {};\nconst reminderPath = path.join('Shared', 'reminder_log.json');\ntry { reminderLog = JSON.parse(fs.readFileSync(reminderPath, 'utf8')); } catch (e) {}\n\nconst now = Date.now();\nconst DROP_THRESHOLD_MS = 48 * 60 * 60 * 1000;\nconst due = [];\n\nfor (const entry of intakeLog) {\n  const key = entry.project_prefix + ':' + entry.contact_hash;\n  const sent = reminderLog[key] || {};\n\n  if (entry.status === 'nda_pending' && !sent.nda_drop && (now - new Date(entry.created_at).getTime()) > DROP_THRESHOLD_MS) {\n    due.push({ ...entry, reminder_type: 'nda_drop', key });\n  }\n  if (entry.status === 'intake_complete' && !sent.payment_drop && (now - new Date(entry.intake_complete_at).getTime()) > DROP_THRESHOLD_MS) {\n    due.push({ ...entry, reminder_type: 'payment_drop', key });\n  }\n}\n\nreturn due.map(d => ({ json: d }));\n"
+      },
+      "id": "12000001-0000-4000-8000-000000000002",
+      "name": "Find Reminder-Eligible Contacts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-780, 0]
+    },
+    {
+      "parameters": {
+        "fromEmail": "hello@circleofcareacademy.org",
+        "toEmail": "={{ $json.email }}",
+        "subject": "={{ $json.reminder_type === 'nda_drop' ? 'Your free deliverable is waiting' : 'Complete your order' }}",
+        "text": "={{ $json.reminder_type === 'nda_drop' ? 'You started the NDA but did not finish -- your free checklist is one step away.' : 'You signed the NDA -- payment is the last step to receive your package.' }}"
+      },
+      "id": "12000001-0000-4000-8000-000000000003",
+      "name": "Send Reminder",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [-560, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Serialized write, same pattern as Global DNC -- one workflow, one\n// append operation at a time, never touching the contended primary files.\nconst fs = require('fs');\nconst path = require('path');\nconst reminderPath = path.join('Shared', 'reminder_log.json');\n\nlet reminderLog = {};\ntry { reminderLog = JSON.parse(fs.readFileSync(reminderPath, 'utf8')); } catch (e) {}\n\nif (!reminderLog[$json.key]) reminderLog[$json.key] = {};\nreminderLog[$json.key][$json.reminder_type === 'nda_drop' ? 'nda_drop' : 'payment_drop'] = new Date().toISOString();\n\nfs.writeFileSync(reminderPath, JSON.stringify(reminderLog, null, 2), 'utf8');\nreturn [{ json: $json }];\n"
+      },
+      "id": "12000001-0000-4000-8000-000000000004",
+      "name": "Record Reminder Sent (isolated log)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-340, 0]
+    }
+  ],
+  "connections": {
+    "Twice Daily": { "main": [[{ "node": "Find Reminder-Eligible Contacts", "type": "main", "index": 0 }]] },
+    "Find Reminder-Eligible Contacts": { "main": [[{ "node": "Send Reminder", "type": "main", "index": 0 }]] },
+    "Send Reminder": { "main": [[{ "node": "Record Reminder Sent (isolated log)", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

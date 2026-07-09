@@ -1,0 +1,42 @@
+{
+  "name": "Circle of Care - 20 - Deploy",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "20000001-0000-4000-8000-000000000001",
+      "name": "Start (Quality Gate passed)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-1000, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Local file copy into public_html -- derived + web assets ONLY.\n// Master set never leaves Working (A9/A15 non-negotiable). Uses\n// fs.copyFileSync, same discipline as Derive Tier Packages (05) --\n// no large buffers held in node memory.\n\nconst fs = require('fs');\nconst path = require('path');\n\nconst prefix = $json.project_prefix;\nconst derivedRoot = path.join('Working', prefix, 'derived');\nconst webDestRoot = path.join('public_html', 'files', prefix);\n\nfunction copyTree(src, dest) {\n  fs.mkdirSync(dest, { recursive: true });\n  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {\n    const s = path.join(src, entry.name);\n    const d = path.join(dest, entry.name);\n    if (entry.isDirectory()) copyTree(s, d);\n    else fs.copyFileSync(s, d);\n  }\n}\n\ncopyTree(derivedRoot, webDestRoot);\n\n// Explicit guard, not just a convention -- refuse to proceed if\n// anything under master_set/ is about to be copied.\nconst masterSetPath = path.join('Working', prefix, 'master_set');\nif (webDestRoot.includes('master_set') || fs.existsSync(path.join(webDestRoot, '..', 'master_set'))) {\n  throw new Error('Deploy guard: refusing a copy path that could expose the master set.');\n}\n\nreturn [{ json: { project_prefix: prefix, deployed: true, deployed_at: new Date().toISOString() } }];\n"
+      },
+      "id": "20000001-0000-4000-8000-000000000002",
+      "name": "Copy Derived Packages Only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-780, 0]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "PLACEHOLDER_LAUNCH_WORKFLOW_ID", "mode": "list" },
+        "workflowInputs": { "mappingMode": "defineBelow", "value": { "project_prefix": "={{ $json.project_prefix }}" } },
+        "options": { "waitForSubWorkflow": false }
+      },
+      "id": "20000001-0000-4000-8000-000000000003",
+      "name": "Enable For Launch",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [-560, 0],
+      "notes": "Launch (15) already runs on its own daily cron across all active projects -- this hand-off marks the project as launch-eligible, it doesn't trigger an immediate send."
+    }
+  ],
+  "connections": {
+    "Start (Quality Gate passed)": { "main": [[{ "node": "Copy Derived Packages Only", "type": "main", "index": 0 }]] },
+    "Copy Derived Packages Only": { "main": [[{ "node": "Enable For Launch", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

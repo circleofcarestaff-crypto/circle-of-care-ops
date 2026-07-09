@@ -1,0 +1,41 @@
+{
+  "name": "Circle of Care - 05 - Derive Tier Packages",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "05000001-0000-4000-8000-000000000001",
+      "name": "Start (from Build Master Set)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-600, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// File-selection logic (B1): fs.copyFileSync only, no heavy objects\n// held in node memory. Slices the master set into one derived copy\n// per tier -- each holds exactly that tier's components, nothing more.\n// The master set itself never leaves Working (A9 non-negotiables).\n\nconst fs = require('fs');\nconst path = require('path');\n\nconst prefix = $json.project_prefix;\nconst tierMap = JSON.parse(fs.readFileSync(path.join('Working', prefix, 'tier_map.json'), 'utf8'));\nconst masterDir = path.join('Working', prefix, 'master_set');\n\nconst tierFiles = {\n  lowest: ['compliance_checklist.md'],\n  mid: ['sow_budget.md'],\n  full: ['compliance_checklist.md', 'end_to_end_drafting.md', 'sow_budget.md']\n};\n\nfor (const tier of Object.keys(tierFiles)) {\n  const destDir = path.join('Working', prefix, 'derived', tier);\n  fs.mkdirSync(destDir, { recursive: true });\n  for (const fname of tierFiles[tier]) {\n    const src = path.join(masterDir, fname);\n    const dest = path.join(destDir, fname);\n    if (fs.existsSync(src)) {\n      fs.copyFileSync(src, dest); // fs.copyFileSync only -- no buffer held in memory\n    }\n  }\n}\n\nreturn [{ json: { project_prefix: prefix, derived_complete: true } }];\n"
+      },
+      "id": "05000001-0000-4000-8000-000000000002",
+      "name": "Slice Into Tier Packages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-380, 0]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "PLACEHOLDER_EMAIL_TEMPLATES_ID", "mode": "list" },
+        "workflowInputs": { "mappingMode": "defineBelow", "value": { "project_prefix": "={{ $json.project_prefix }}" } },
+        "options": { "waitForSubWorkflow": false }
+      },
+      "id": "05000001-0000-4000-8000-000000000003",
+      "name": "Hand Off to Email Templates",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [-160, 0]
+    }
+  ],
+  "connections": {
+    "Start (from Build Master Set)": { "main": [[{ "node": "Slice Into Tier Packages", "type": "main", "index": 0 }]] },
+    "Slice Into Tier Packages": { "main": [[{ "node": "Hand Off to Email Templates", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

@@ -1,0 +1,114 @@
+{
+  "name": "Circle of Care - 09 - NDA Signature Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "nda-signature-prod",
+        "responseMode": "responseNode",
+        "options": { "rawBody": true }
+      },
+      "id": "09000001-0000-4000-8000-000000000001",
+      "name": "Signature Webhook (raw body, static path)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1400, 0],
+      "webhookId": "nda-signature-prod"
+    },
+    {
+      "parameters": {
+        "jsCode": "let parsed;\ntry { parsed = JSON.parse($json.body || '{}'); } catch (e) { return [{ json: { valid: false, status: 400 } }]; }\nconst fs = require('fs');\nconst path = require('path');\nlet activeProjects = [];\ntry { activeProjects = JSON.parse(fs.readFileSync(path.join('Shared', 'processed_projects.json'), 'utf8')); } catch (e) {}\nif (!parsed.project_prefix || !activeProjects.includes(parsed.project_prefix)) {\n  return [{ json: { valid: false, status: 400 } }];\n}\nif (!parsed.typed_name || !parsed.consent === true) {\n  return [{ json: { valid: false, status: 400 } }];\n}\nreturn [{ json: { valid: true, project_prefix: parsed.project_prefix, typed_name: parsed.typed_name, ip: $json.headers['x-forwarded-for'] || $json.headers['remote-addr'] || '', consent: true } }];\n"
+      },
+      "id": "09000001-0000-4000-8000-000000000002",
+      "name": "Validate Signature Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1180, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Signature record saved SYNCHRONOUSLY into durable, project-scoped\n// operational state -- contact-hash-scoped, not only in the ephemeral\n// intake_cache/. This is what the retry queue later points to, never\n// duplicates (A9).\n\nconst fs = require('fs');\nconst path = require('path');\nconst crypto = require('crypto');\n\nconst email = $json.email || $json.typed_name; // signature step precedes email capture on some flows; hash on best available identity\nconst hash = crypto.createHash('sha256').update(String(email).toLowerCase().trim()).digest('hex');\n\nconst record = {\n  contact_hash: hash,\n  project_prefix: $json.project_prefix,\n  typed_name: $json.typed_name,\n  timestamp: new Date().toISOString(),\n  ip: $json.ip,\n  consent: true\n};\n\nconst dir = path.join('Working', $json.project_prefix, 'signatures');\nfs.mkdirSync(dir, { recursive: true });\nfs.writeFileSync(path.join(dir, hash + '.json'), JSON.stringify(record, null, 2), 'utf8');\n\nreturn [{ json: record }];\n"
+      },
+      "id": "09000001-0000-4000-8000-000000000003",
+      "name": "Save Durable Signature Record (sync)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-960, -100]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'signed' } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "09000001-0000-4000-8000-000000000004",
+      "name": "Respond 200 (unlock Intake immediately)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [-740, -220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// pdf-lib background generation. Sanitizes typed_name first (alphanumeric\n// + punctuation only) before it touches PDF metadata. Output path is\n// contact-hash + fresh random token -- never shared or fixed (A9).\n\nconst crypto = require('crypto');\n\nconst safeName = String($json.typed_name).replace(/[^\\w\\s.,'-]/g, '').slice(0, 200);\nconst runToken = crypto.randomBytes(8).toString('hex');\nconst outPath = `Working/${$json.project_prefix}/pdf_output/tmp_${$json.contact_hash}_${runToken}.pdf`;\n\ntry {\n  const { PDFDocument, rgb } = require('pdf-lib');\n  const fs = require('fs');\n  const path = require('path');\n\n  const templateBytes = fs.readFileSync(path.join('Originals', 'brand_shell', 'nda_template.pdf'));\n  const pdfDoc = await PDFDocument.load(templateBytes);\n  pdfDoc.setSubject('Executed NDA - ' + $json.project_prefix);\n  pdfDoc.setKeywords([safeName, $json.timestamp]);\n\n  const page = pdfDoc.getPages()[0];\n  page.drawText(safeName, { x: 72, y: 100, size: 12, color: rgb(0, 0, 0) });\n  page.drawText('Signed: ' + $json.timestamp + ' from ' + $json.ip, { x: 72, y: 80, size: 8 });\n\n  fs.mkdirSync(path.dirname(outPath), { recursive: true });\n  const bytes = await pdfDoc.save();\n  fs.writeFileSync(outPath, bytes);\n\n  return [{ json: { ...$json, pdf_generated: true, pdf_path: outPath } }];\n} catch (e) {\n  return [{ json: { ...$json, pdf_generated: false, error: String(e.message || e) } }];\n}\n"
+      },
+      "id": "09000001-0000-4000-8000-000000000005",
+      "name": "Generate Countersigned PDF (background)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-740, 0],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "09000001-0001-4000-8000-000000000010", "leftValue": "={{ $json.pdf_generated }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "09000001-0000-4000-8000-000000000006",
+      "name": "PDF Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-520, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// On failure: strip the heavy payload entirely, serialize only minimal\n// metadata as a POINTER to the durable signature record already saved\n// above -- never a duplicate of it. Staggered delay, explicit slot\n// release, no in-memory buffer held across the wait (A9/B1).\n\nconst fs = require('fs');\nconst path = require('path');\n\nlet queue = [];\nconst queuePath = path.join('Working', 'cache', 'retry_queue.tmp');\ntry { queue = JSON.parse(fs.readFileSync(queuePath, 'utf8')); } catch (e) {}\n\nconst existing = queue.find(q => q.contact_hash === $json.contact_hash && q.project_prefix === $json.project_prefix);\nconst attemptCount = existing ? existing.attempt_count + 1 : 1;\n\nqueue = queue.filter(q => !(q.contact_hash === $json.contact_hash && q.project_prefix === $json.project_prefix));\nqueue.push({\n  contact_hash: $json.contact_hash,\n  project_prefix: $json.project_prefix,\n  attempt_count: attemptCount,\n  next_attempt_after: new Date(Date.now() + attemptCount * 60000).toISOString()\n});\n\nfs.mkdirSync(path.dirname(queuePath), { recursive: true });\nfs.writeFileSync(queuePath, JSON.stringify(queue, null, 2), 'utf8');\n\n// $json's own pdf/text buffers are not carried forward -- this node's\n// output is metadata only, execution ends here for this attempt.\nreturn [{ json: { contact_hash: $json.contact_hash, project_prefix: $json.project_prefix, queued_for_retry: true, attempt_count: attemptCount } }];\n"
+      },
+      "id": "09000001-0000-4000-8000-000000000007",
+      "name": "Queue Retry (metadata pointer only)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-300, 100]
+    },
+    {
+      "parameters": {
+        "fromEmail": "hello@circleofcareacademy.org",
+        "toEmail": "={{ $json.recipient_email }}",
+        "subject": "Your executed NDA copy",
+        "text": "Attached is your countersigned NDA copy.",
+        "options": {
+          "attachments": "={{ $json.pdf_path }}"
+        }
+      },
+      "id": "09000001-0000-4000-8000-000000000008",
+      "name": "Send Confirmation Receipt",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [-300, -100]
+    }
+  ],
+  "connections": {
+    "Signature Webhook (raw body, static path)": { "main": [[{ "node": "Validate Signature Payload", "type": "main", "index": 0 }]] },
+    "Validate Signature Payload": { "main": [[{ "node": "Save Durable Signature Record (sync)", "type": "main", "index": 0 }]] },
+    "Save Durable Signature Record (sync)": { "main": [[{ "node": "Respond 200 (unlock Intake immediately)", "type": "main", "index": 0 }, { "node": "Generate Countersigned PDF (background)", "type": "main", "index": 0 }]] },
+    "Generate Countersigned PDF (background)": { "main": [[{ "node": "PDF Succeeded?", "type": "main", "index": 0 }]] },
+    "PDF Succeeded?": { "main": [[{ "node": "Send Confirmation Receipt", "type": "main", "index": 0 }], [{ "node": "Queue Retry (metadata pointer only)", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

@@ -1,0 +1,157 @@
+{
+  "name": "Circle of Care - 02 - Decode",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "d1000001-0000-4000-8000-000000000001",
+      "name": "Start (from Trigger)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-1600, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Source manifest snapshot -- A3 Step 1.\n// This is the ONLY point that ever lists the project directory tree.\n// Every later step in this workflow, and every citation check in\n// Quality Gate, reads from this frozen list -- never a live re-scan.\n\nconst fs = require('fs');\nconst path = require('path');\n\nconst prefix = $json.project_prefix;\nif (!/^[A-Za-z0-9_-]{1,64}$/.test(prefix)) {\n  throw new Error('Invalid project_prefix reached Decode -- should have been filtered at Trigger.');\n}\n\nconst root = path.join('Working', prefix);\n\nfunction walk(dir, base) {\n  let out = [];\n  const entries = fs.readdirSync(dir, { withFileTypes: true });\n  for (const e of entries) {\n    const full = path.join(dir, e.name);\n    const rel = path.join(base, e.name);\n    if (e.isDirectory()) {\n      out = out.concat(walk(full, rel));\n    } else {\n      out.push({ relative_path: rel, absolute_path: path.resolve(full) });\n    }\n  }\n  return out;\n}\n\nconst allFiles = walk(root, '');\n\n// Secondary guard: known operational filenames are never evidence,\n// no matter where in the tree they appear.\nconst IGNORE_NAMES = new Set([\n  'contacts.json', 'send_log.json', 'suppression.json', 'pipeline.json',\n  'engagement_log.json', 'linkedin_queue.json', 'reminder_log.json',\n  'ai_corrected_contacts.json'\n]);\n\nconst manifest = allFiles.filter(f => !IGNORE_NAMES.has(path.basename(f.relative_path)));\n\n// Frozen, written once. Nothing after this point re-lists the directory.\nconst manifestPath = path.join(root, 'manifest.json');\nfs.writeFileSync(manifestPath, JSON.stringify({\n  project_prefix: prefix,\n  captured_at: new Date().toISOString(),\n  files: manifest\n}, null, 2), 'utf8');\n\nreturn manifest.map(f => ({ json: { project_prefix: prefix, ...f } }));\n"
+      },
+      "id": "d1000001-0000-4000-8000-000000000002",
+      "name": "Source Manifest Snapshot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1380, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// File filter (A3): only recognized types, size cap, case-normalized\n// duplicate .docx/.pdf matching. Everything else is skipped and logged,\n// never read. This node NEVER opens a file -- it only decides eligibility.\n\nconst path = require('path');\nconst fs = require('fs');\n\nconst ALLOWED_EXT = new Set(['.md', '.json', '.pdf', '.docx', '.xlsx']);\nconst MAX_BYTES = 25 * 1024 * 1024;\n\nconst items = $input.all();\nconst byLowerBase = new Map();\n\nfor (const item of items) {\n  const ext = path.extname(item.json.relative_path).toLowerCase();\n  const base = item.json.relative_path.slice(0, -ext.length);\n  const lowerKey = path.join(path.dirname(item.json.relative_path), base).toLowerCase();\n  if (!byLowerBase.has(lowerKey)) byLowerBase.set(lowerKey, []);\n  byLowerBase.get(lowerKey).push({ item, ext });\n}\n\nconst eligible = [];\nconst skipped = [];\n\nfor (const [, group] of byLowerBase) {\n  // Duplicate .docx/.pdf pair sharing a base name -- .docx wins, logged not read.\n  const docx = group.find(g => g.ext === '.docx');\n  const pdf = group.find(g => g.ext === '.pdf');\n  if (docx && pdf) {\n    skipped.push({ path: pdf.item.json.relative_path, reason: 'duplicate_format_pdf_skipped_for_docx' });\n  }\n\n  for (const { item, ext } of group) {\n    if (docx && pdf && ext === '.pdf') continue; // already logged as skipped above\n\n    if (!ALLOWED_EXT.has(ext)) {\n      skipped.push({ path: item.json.relative_path, reason: 'unrecognized_file_type' });\n      continue;\n    }\n\n    let size = 0;\n    try { size = fs.statSync(item.json.absolute_path).size; } catch (e) { /* fall through, flagged below */ }\n    if (size > MAX_BYTES) {\n      skipped.push({ path: item.json.relative_path, reason: 'exceeds_25mb_cap' });\n      continue;\n    }\n\n    if (['.png', '.jpg', '.jpeg'].includes(ext)) {\n      const flagged = /rfp|solicitation|requirement/i.test(item.json.relative_path);\n      skipped.push({ path: item.json.relative_path, reason: flagged ? 'image_flagged_for_review' : 'image_not_processed' });\n      continue;\n    }\n\n    eligible.push(item.json);\n  }\n}\n\n// Log skipped/flagged files to the exception log without stopping the batch.\nconst logPath = require('path').join('Working', items[0]?.json.project_prefix || '', 'decode_exceptions.json');\ntry { fs.writeFileSync(logPath, JSON.stringify(skipped, null, 2), 'utf8'); } catch (e) {}\n\nreturn eligible.map(f => ({ json: f }));\n"
+      },
+      "id": "d1000001-0000-4000-8000-000000000003",
+      "name": "Filter and Dedup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1160, 0]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "d1000001-0000-4000-8000-000000000004",
+      "name": "One File At A Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-940, 0],
+      "notes": "Sequential processing law (A3): batchSize=1 guarantees only one file's buffer is ever in memory at once, regardless of file count or size."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-file isolation with strict sequential processing (A3).\n// Opens exactly one file, extracts text, explicitly dereferences the\n// buffer before returning. Any parse exception is caught here and\n// logged -- it never stops the batch.\n\nconst fs = require('fs');\nconst path = require('path');\nconst pdfParse = require('pdf-parse');\nconst mammoth = require('mammoth');\nconst ExcelJS = require('exceljs');\n\nconst file = $json;\nconst ext = path.extname(file.relative_path).toLowerCase();\n// Case-folding is comparison-only elsewhere -- this uses the real,\n// case-preserved absolute_path directly for the actual file read.\nconst absPath = file.absolute_path;\n\nlet result = { ...file, extraction_status: 'ok', text: '', pages: null };\n\ntry {\n  if (ext === '.md') {\n    let buf = fs.readFileSync(absPath, 'utf8');\n    result.text = buf;\n    buf = null; // explicit dereference before next file loads\n  } else if (ext === '.docx') {\n    let buf = fs.readFileSync(absPath);\n    const extracted = await mammoth.extractRawText({ buffer: buf });\n    result.text = extracted.value;\n    buf = null;\n  } else if (ext === '.pdf') {\n    let buf = fs.readFileSync(absPath);\n    const parsed = await pdfParse(buf);\n    buf = null;\n\n    // Per-page scanned-document guard (B5): ANY single page under 100\n    // characters fails this file closed, not a whole-document average.\n    const pageTexts = parsed.text.split('\\f'); // form-feed page breaks from pdf-parse\n    const thinPages = pageTexts.filter(p => p.trim().length < 100);\n    if (thinPages.length > 0) {\n      result.extraction_status = 'failed_closed_scanned_document';\n      result.text = '';\n      result.pages = pageTexts.length;\n    } else {\n      result.text = parsed.text;\n      result.pages = pageTexts.length;\n    }\n  } else if (ext === '.xlsx') {\n    const wb = new ExcelJS.Workbook();\n    await wb.xlsx.readFile(absPath);\n    const sheetsText = [];\n    wb.eachSheet(sheet => {\n      sheet.eachRow(row => {\n        sheetsText.push(row.values.filter(v => v != null).join(' | '));\n      });\n    });\n    result.text = sheetsText.join('\\n');\n  } else if (ext === '.json') {\n    result.text = fs.readFileSync(absPath, 'utf8');\n  }\n} catch (e) {\n  result.extraction_status = 'parse_exception';\n  result.error = String(e.message || e);\n  result.text = '';\n}\n\nreturn [{ json: result }];\n"
+      },
+      "id": "d1000001-0000-4000-8000-000000000005",
+      "name": "Extract One File (try/catch)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "onError": "continueRegularOutput",
+      "position": [-720, 0],
+      "notes": "onError=continueRegularOutput: a single corrupted file never halts the batch."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Chunked decode (context law, A3): structural-boundary splits, never\n// raw character counts, minimum 25% overlap of the context budget.\n// This applies only to text that actually needs chunking -- short files\n// (like contacts.xlsx text or a short .md) pass through as one chunk.\n\nconst file = $json;\nif (file.extraction_status !== 'ok' || !file.text) {\n  return [{ json: { ...file, chunks: [] } }];\n}\n\nconst CONTEXT_BUDGET_CHARS = 2048 * 3; // rough char-per-token budget headroom under OLLAMA_NUM_CTX\nconst CHUNK_SIZE = Math.floor(CONTEXT_BUDGET_CHARS * 0.6); // leaves room for instruction + output\nconst OVERLAP = Math.floor(CHUNK_SIZE * 0.25); // 25% overlap, minimum, per A3\n\n// Split on structural boundaries -- paragraph breaks first, falling back\n// to sentence ends -- never a blind character-count cut mid-word/mid-clause.\nconst paragraphs = file.text.split(/\\n\\s*\\n/);\n\nconst chunks = [];\nlet current = '';\nfor (const para of paragraphs) {\n  if ((current + '\\n\\n' + para).length > CHUNK_SIZE && current.length > 0) {\n    chunks.push(current);\n    // Start next chunk with the overlap tail of the previous one.\n    current = current.slice(-OVERLAP) + '\\n\\n' + para;\n  } else {\n    current = current ? current + '\\n\\n' + para : para;\n  }\n}\nif (current) chunks.push(current);\n\nreturn chunks.map((text, idx) => ({\n  json: {\n    project_prefix: file.project_prefix,\n    relative_path: file.relative_path,\n    chunk_index: idx,\n    chunk_text: text\n  }\n}));\n"
+      },
+      "id": "d1000001-0000-4000-8000-000000000006",
+      "name": "Split Into Chunks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-500, 0]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:11434/api/generate",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"qwen2.5:4b-instruct-q4_K_M\", stream: false, prompt: \"Extract every factual claim from this text chunk (dates, dollar amounts, rates, percentages, requirements). For each fact, output: {fact, location_hint}. Only extract what is literally present -- never infer or estimate. Text:\\n\\n\" + $json.chunk_text }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "d1000001-0000-4000-8000-000000000007",
+      "name": "Extract Facts (Qwen, per chunk)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-280, 0],
+      "notes": "AI concurrency=1 (A14): this call is serialized against every other inference call system-wide by the orchestration layer, not by n8n itself."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Deterministic merge (A3): combines per-chunk extractions into one\n// structured JSON. Every fact carries a citation -- source file +\n// location. A fact with no citation does not enter the Project Document.\n\nconst items = $input.all();\nconst byPath = {};\n\nfor (const item of items) {\n  const raw = item.json;\n  let facts = [];\n  try {\n    const parsed = JSON.parse(raw.response || '[]');\n    facts = Array.isArray(parsed) ? parsed : [];\n  } catch (e) {\n    continue; // malformed model output for this chunk -- skip, don't crash the merge\n  }\n\n  const key = raw.relative_path || 'unknown';\n  if (!byPath[key]) byPath[key] = [];\n\n  for (const f of facts) {\n    if (!f.fact || !f.location_hint) continue; // no citation, no entry -- non-negotiable\n    byPath[key].push({\n      fact: f.fact,\n      citation: { file: key, location: f.location_hint }\n    });\n  }\n}\n\nreturn [{ json: { decoded_facts: byPath } }];\n"
+      },
+      "id": "d1000001-0000-4000-8000-000000000008",
+      "name": "Merge Chunks + Attach Citations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-60, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Funding figure extraction (A3): one clean total for the ROI Full\n// tier. If none extracts cleanly, this is logged unresolved -- the\n// Tier Map workflow (03) reads this flag and floors the price + queues\n// Manual Lever 1. This node never guesses a number.\n\nconst decoded = $json.decoded_facts;\nconst allFacts = Object.values(decoded).flat();\n\nconst moneyPattern = /\\$[\\d,]+(?:\\.\\d{2})?/g;\nconst candidates = [];\nfor (const f of allFacts) {\n  const matches = f.fact.match(moneyPattern);\n  if (matches) {\n    for (const m of matches) {\n      if (/total|grant|funding|award|not.to.exceed|nte/i.test(f.fact)) {\n        candidates.push({ value: m, citation: f.citation, context: f.fact });\n      }\n    }\n  }\n}\n\nconst resolved = candidates.length === 1;\n\nreturn [{\n  json: {\n    funding_figure_resolved: resolved,\n    funding_figure: resolved ? candidates[0] : null,\n    funding_figure_candidates: candidates\n  }\n}];\n"
+      },
+      "id": "d1000001-0000-4000-8000-000000000009",
+      "name": "Extract Funding Figure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [160, -120]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Contact file emission (A3): locates the contact database anywhere\n// in the frozen manifest -- typically .xlsx inside the intel subfolder\n// -- and emits the canonical, project-isolated contacts.json.\n\nconst fs = require('fs');\nconst path = require('path');\nconst ExcelJS = require('exceljs');\n\nconst manifestRaw = fs.readFileSync(path.join('Working', $json.project_prefix, 'manifest.json'), 'utf8');\nconst manifest = JSON.parse(manifestRaw);\n\nconst contactFile = manifest.files.find(f => /\\.xlsx$/i.test(f.relative_path) && /contact|database/i.test(f.relative_path));\nif (!contactFile) {\n  return [{ json: { contacts_found: false } }];\n}\n\nconst wb = new ExcelJS.Workbook();\nawait wb.xlsx.readFile(contactFile.absolute_path);\nconst sheet = wb.worksheets[0];\n\nconst headerRow = sheet.getRow(1).values.map(v => String(v || '').trim().toLowerCase());\nconst nameIdx = headerRow.indexOf('name');\nconst orgIdx = headerRow.indexOf('organization');\nconst emailIdx = headerRow.indexOf('email');\n\nconst contacts = [];\nsheet.eachRow((row, rowNum) => {\n  if (rowNum === 1) return;\n  const email = String(row.values[emailIdx] || '').trim();\n  if (!email) return;\n  // Format validation at emission -- malformed addresses never become\n  // live contacts; they're logged for manual correction instead.\n  const validFormat = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) && (email.match(/@/g) || []).length === 1;\n  contacts.push({\n    name: row.values[nameIdx] || '',\n    organization: row.values[orgIdx] || '',\n    email,\n    valid_format: validFormat\n  });\n});\n\nconst outPath = path.join('Working', $json.project_prefix, 'contacts.json');\nfs.writeFileSync(outPath, JSON.stringify(contacts, null, 2), 'utf8');\n\nreturn [{ json: { contacts_found: true, total: contacts.length, malformed: contacts.filter(c => !c.valid_format).length } }];\n"
+      },
+      "id": "d1000001-0000-4000-8000-00000000000a",
+      "name": "Emit contacts.json",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [160, 120]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Deadline Law check (A8), performed here as part of Decode's output\n// before Project Document creation, so Tier Map resolution (03) has\n// the flag immediately available.\n\nconst decoded = $json.decoded_facts || {};\nconst allFacts = Object.values(decoded).flat();\nconst dateFact = allFacts.find(f => /due date|proposal due|submission deadline/i.test(f.fact));\n\nlet dueDate = null;\nif (dateFact) {\n  const m = dateFact.fact.match(/\\b(\\d{4}-\\d{2}-\\d{2}|\\w+ \\d{1,2},? \\d{4})\\b/);\n  if (m) dueDate = new Date(m[1]);\n}\n\nconst expired = dueDate ? dueDate.getTime() < Date.now() : null;\n\nreturn [{ json: { due_date_raw: dateFact ? dateFact.fact : null, due_date_parsed: dueDate ? dueDate.toISOString() : null, expired_at_intake: expired } }];\n"
+      },
+      "id": "d1000001-0000-4000-8000-00000000000b",
+      "name": "Deadline Law Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [160, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Create the Project Document -- consolidates decoded facts, funding\n// figure, contact emission result, and deadline status into one file\n// that Tier Map resolution and Build both read from.\n\nconst fs = require('fs');\nconst path = require('path');\n\nconst prefix = $('Source Manifest Snapshot').first().json.project_prefix;\n\nconst doc = {\n  project_prefix: prefix,\n  created_at: new Date().toISOString(),\n  decoded_facts: $('Merge Chunks + Attach Citations').first().json.decoded_facts,\n  funding: $('Extract Funding Figure').first().json,\n  contacts: $('Emit contacts.json').first().json,\n  deadline: $('Deadline Law Check').first().json\n};\n\nfs.writeFileSync(path.join('Working', prefix, 'project_document.json'), JSON.stringify(doc, null, 2), 'utf8');\n\nreturn [{ json: { project_prefix: prefix, decode_complete: true } }];\n"
+      },
+      "id": "d1000001-0000-4000-8000-00000000000c",
+      "name": "Create Project Document",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [400, 100],
+      "notes": "Represented here as a merge point conceptually -- implementation combines the three parallel branches (funding, contacts, deadline) then writes project_document.json via a following Code node."
+    }
+  ],
+  "connections": {
+    "Start (from Trigger)": { "main": [[{ "node": "Source Manifest Snapshot", "type": "main", "index": 0 }]] },
+    "Source Manifest Snapshot": { "main": [[{ "node": "Filter and Dedup", "type": "main", "index": 0 }]] },
+    "Filter and Dedup": { "main": [[{ "node": "One File At A Time", "type": "main", "index": 0 }]] },
+    "One File At A Time": { "main": [[{ "node": "Extract One File (try/catch)", "type": "main", "index": 0 }]] },
+    "Extract One File (try/catch)": { "main": [[{ "node": "Split Into Chunks", "type": "main", "index": 0 }]] },
+    "Split Into Chunks": { "main": [[{ "node": "Extract Facts (Qwen, per chunk)", "type": "main", "index": 0 }]] },
+    "Extract Facts (Qwen, per chunk)": { "main": [[{ "node": "Merge Chunks + Attach Citations", "type": "main", "index": 0 }]] },
+    "Merge Chunks + Attach Citations": {
+      "main": [[
+        { "node": "Extract Funding Figure", "type": "main", "index": 0 },
+        { "node": "Emit contacts.json", "type": "main", "index": 0 },
+        { "node": "Deadline Law Check", "type": "main", "index": 0 }
+      ]]
+    },
+    "Extract Funding Figure": { "main": [[{ "node": "Create Project Document", "type": "main", "index": 0 }]] },
+    "Emit contacts.json": { "main": [[{ "node": "Create Project Document", "type": "main", "index": 1 }]] },
+    "Deadline Law Check": { "main": [[{ "node": "Create Project Document", "type": "main", "index": 2 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

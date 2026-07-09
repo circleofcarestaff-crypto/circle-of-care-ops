@@ -1,0 +1,52 @@
+{
+  "name": "Circle of Care - 07 - Email Templates",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "07000001-0000-4000-8000-000000000001",
+      "name": "Start (from Contact Research)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-600, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Field substitution only (A6/B1) -- deterministic, no AI. Fills the\n// fixed brand shell for E1-E5 with values read from the Tier Map,\n// Project Document, and contact record -- never re-derived here.\n\nconst fs = require('fs');\nconst path = require('path');\n\nconst prefix = $json.project_prefix;\nconst tierMap = JSON.parse(fs.readFileSync(path.join('Working', prefix, 'tier_map.json'), 'utf8'));\nconst doc = JSON.parse(fs.readFileSync(path.join('Working', prefix, 'project_document.json'), 'utf8'));\n\nconst TEMPLATE_DIR = path.join('Originals', 'brand_shell'); // read-only master set\nconst OUT_DIR = path.join('Working', prefix, 'email_templates');\nfs.mkdirSync(OUT_DIR, { recursive: true });\n\nconst templates = ['E1_OPEN', 'E2_VALUE', 'E3_CLOSE', 'E4_FULL', 'E5_WHITE_LABEL'];\n\nfor (const t of templates) {\n  let shell = fs.readFileSync(path.join(TEMPLATE_DIR, t + '.html'), 'utf8');\n  shell = shell\n    .replace(/{{SOLICITATION_NAME}}/g, doc.decoded_facts ? 'the solicitation' : '')\n    .replace(/{{MID_PRICE}}/g, tierMap.mid.price)\n    .replace(/{{FULL_PRICE}}/g, tierMap.full.price)\n    .replace(/{{UNSUBSCRIBE_LINK}}/g, 'https://circleofcareacademy.org/unsubscribe.php')\n    .replace(/{{NDA_LINK}}/g, `https://circleofcareacademy.org/${prefix}-nda.html`);\n  fs.writeFileSync(path.join(OUT_DIR, t + '.html'), shell, 'utf8');\n}\n\nreturn [{ json: { project_prefix: prefix, templates_built: templates.length } }];\n"
+      },
+      "id": "07000001-0000-4000-8000-000000000002",
+      "name": "Fill Brand Shell Templates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-380, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Placeholder scan -- no unfilled merge fields survive into a sent\n// email (also re-checked independently in Quality Gate, A16).\nconst fs = require('fs');\nconst path = require('path');\nconst dir = path.join('Working', $json.project_prefix, 'email_templates');\nconst issues = [];\nfor (const f of fs.readdirSync(dir)) {\n  const content = fs.readFileSync(path.join(dir, f), 'utf8');\n  if (/{{.*?}}/.test(content)) issues.push({ file: f, reason: 'unfilled_placeholder' });\n}\nreturn [{ json: { project_prefix: $json.project_prefix, placeholder_scan_issues: issues } }];\n"
+      },
+      "id": "07000001-0000-4000-8000-000000000003",
+      "name": "Placeholder Scan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-160, 0]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "PLACEHOLDER_QUALITY_GATE_ID", "mode": "list" },
+        "workflowInputs": { "mappingMode": "defineBelow", "value": { "project_prefix": "={{ $json.project_prefix }}" } },
+        "options": { "waitForSubWorkflow": false }
+      },
+      "id": "07000001-0000-4000-8000-000000000004",
+      "name": "Hand Off to Quality Gate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [60, 0]
+    }
+  ],
+  "connections": {
+    "Start (from Contact Research)": { "main": [[{ "node": "Fill Brand Shell Templates", "type": "main", "index": 0 }]] },
+    "Fill Brand Shell Templates": { "main": [[{ "node": "Placeholder Scan", "type": "main", "index": 0 }]] },
+    "Placeholder Scan": { "main": [[{ "node": "Hand Off to Quality Gate", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

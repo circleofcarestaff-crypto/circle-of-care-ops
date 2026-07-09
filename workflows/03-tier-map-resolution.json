@@ -1,0 +1,84 @@
+{
+  "name": "Circle of Care - 03 - Tier Map Resolution",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "e1000001-0000-4000-8000-000000000001",
+      "name": "Start (from Decode)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-800, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// A4: default pricing table resolution, auto from table, exceptions\n// queued non-blocking. Currency canonicalization bound to the write\n// operation itself -- .toFixed(2) at the exact moment of write, here,\n// the one place a price is ever generated.\n\nconst fs = require('fs');\nconst path = require('path');\n\nconst prefix = $json.project_prefix;\nconst docPath = path.join('Working', prefix, 'project_document.json');\nconst doc = JSON.parse(fs.readFileSync(docPath, 'utf8'));\n\nconst FLAT_RATE_FLOOR = 1500.00; // no standalone component prices below this, ever (A15)\nconst FULL_TIER_MIN = 2500.00;\nconst ROI_PERCENT = 0.015;\n\nconst tierMap = { lowest: null, mid: null, full: null, unresolved_components: [] };\n\n// Lowest -- always free, no gate.\ntierMap.lowest = { component: 'compliance_checklist', price: '0.00', gate: 'none' };\n\n// Mid -- component identified from decoded facts against the flat-rate\n// table. Anything that doesn't match queues to Manual Lever 1 instead\n// of guessing a price.\nconst allFacts = Object.values(doc.decoded_facts || {}).flat();\nconst requiresClosout = allFacts.some(f => /closeout|reporting package/i.test(f.fact));\nif (requiresClosout) {\n  tierMap.mid = { component: 'closeout_reporting_package', price: (2500.00).toFixed(2) };\n} else {\n  tierMap.mid = { component: 'standard_turnkey_drafting', price: FLAT_RATE_FLOOR.toFixed(2) };\n}\n\n// Full -- ROI formula against the funding figure, floor + Manual Lever 1\n// if Decode never resolved one clean figure.\nif (doc.funding && doc.funding.funding_figure_resolved) {\n  const raw = doc.funding.funding_figure.value.replace(/[$,]/g, '');\n  const total = parseFloat(raw);\n  const roiPrice = Math.max(total * ROI_PERCENT, FULL_TIER_MIN);\n  tierMap.full = { component: 'full_proposal_package', price: roiPrice.toFixed(2), basis: 'roi_formula' };\n} else {\n  tierMap.full = { component: 'full_proposal_package', price: FULL_TIER_MIN.toFixed(2), basis: 'floor_pending_review' };\n  tierMap.unresolved_components.push('full_tier_funding_figure');\n}\n\n// Deadline Law: expired at intake routes through Manual Lever 1 too.\nif (doc.deadline && doc.deadline.expired_at_intake === true) {\n  tierMap.unresolved_components.push('solicitation_expired_at_intake');\n}\n\nfs.writeFileSync(path.join('Working', prefix, 'tier_map.json'), JSON.stringify(tierMap, null, 2), 'utf8');\n\nreturn [{ json: { project_prefix: prefix, tier_map: tierMap, requires_manual_lever_1: tierMap.unresolved_components.length > 0 } }];\n"
+      },
+      "id": "e1000001-0000-4000-8000-000000000002",
+      "name": "Resolve Tier Map",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-580, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "e1000001-0001-4000-8000-000000000010",
+              "leftValue": "={{ $json.requires_manual_lever_1 }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e1000001-0000-4000-8000-000000000003",
+      "name": "Manual Lever 1 Required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-360, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Manual Lever 1 exception queue -- blocks pricing/launch for the\n// affected scope only. Everything else in the project proceeds; this\n// does not halt Build for components that resolved cleanly.\n\nconst fs = require('fs');\nconst path = require('path');\nconst prefix = $json.project_prefix;\nconst entry = {\n  project_prefix: prefix,\n  queued_at: new Date().toISOString(),\n  reasons: $json.tier_map.unresolved_components,\n  status: 'pending_operator_review'\n};\nlet queue = [];\ntry { queue = JSON.parse(fs.readFileSync(path.join('Shared', 'manual_lever_1_queue.json'), 'utf8')); } catch (e) {}\nqueue.push(entry);\nfs.writeFileSync(path.join('Shared', 'manual_lever_1_queue.json'), JSON.stringify(queue, null, 2), 'utf8');\nreturn [{ json: { ...($json), queued: true } }];\n"
+      },
+      "id": "e1000001-0000-4000-8000-000000000004",
+      "name": "Queue Manual Lever 1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-140, -100]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "PLACEHOLDER_BUILD_WORKFLOW_ID", "mode": "list" },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": { "project_prefix": "={{ $json.project_prefix }}" }
+        },
+        "options": { "waitForSubWorkflow": false }
+      },
+      "id": "e1000001-0000-4000-8000-000000000005",
+      "name": "Hand Off to Build",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [-140, 100],
+      "notes": "Also the re-entry point (A4): resolving a Manual Lever 1 exception later re-enters here for only the affected components, canonicalizing the new price the same way at write time."
+    }
+  ],
+  "connections": {
+    "Start (from Decode)": { "main": [[{ "node": "Resolve Tier Map", "type": "main", "index": 0 }]] },
+    "Resolve Tier Map": { "main": [[{ "node": "Manual Lever 1 Required?", "type": "main", "index": 0 }]] },
+    "Manual Lever 1 Required?": {
+      "main": [
+        [{ "node": "Queue Manual Lever 1", "type": "main", "index": 0 }],
+        [{ "node": "Hand Off to Build", "type": "main", "index": 0 }]
+      ]
+    },
+    "Queue Manual Lever 1": { "main": [[{ "node": "Hand Off to Build", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

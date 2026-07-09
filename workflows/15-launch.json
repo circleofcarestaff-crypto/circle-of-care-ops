@@ -1,0 +1,137 @@
+{
+  "name": "Circle of Care - 15 - Launch",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 19 * * *" }] } },
+      "id": "15000001-0000-4000-8000-000000000001",
+      "name": "Daily 7:00 PM Operator Timezone",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1600, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step gate: each contact's schedule is keyed to THEIR OWN confirmed\n// prior-step delivery, not a fixed cohort date. Overdue throttling:\n// capped per run, drained gradually -- never one burst.\n\nconst fs = require('fs');\nconst path = require('path');\n\nconst PER_RUN_CAP = 80;\nconst SEQUENCE = ['E1', 'E2', 'E3', 'E4'];\n\nlet allContacts = [];\nconst projectDirs = fs.readdirSync('Working', { withFileTypes: true }).filter(d => d.isDirectory());\nfor (const d of projectDirs) {\n  try {\n    const contacts = JSON.parse(fs.readFileSync(path.join('Working', d.name, 'contacts.json'), 'utf8'));\n    for (const c of contacts) if (c.valid_format) allContacts.push({ ...c, project_prefix: d.name });\n  } catch (e) {}\n}\n\nlet sendLog = {};\ntry { sendLog = JSON.parse(fs.readFileSync(path.join('Shared', 'send_log.json'), 'utf8')); } catch (e) {}\n\nconst due = [];\nconst now = Date.now();\n\nfor (const c of allContacts) {\n  const key = c.project_prefix + ':' + c.email;\n  const history = sendLog[key] || {};\n  let nextStep = null;\n\n  for (let i = 0; i < SEQUENCE.length; i++) {\n    const step = SEQUENCE[i];\n    if (history[step] && history[step].confirmed) continue;\n    if (i === 0) { nextStep = step; break; }\n    const prevStep = SEQUENCE[i - 1];\n    const prevConfirmed = history[prevStep] && history[prevStep].confirmed;\n    if (prevConfirmed && (now - new Date(history[prevStep].confirmed_at).getTime()) >= 24 * 60 * 60 * 1000) {\n      nextStep = step;\n    }\n    break;\n  }\n\n  if (nextStep) due.push({ ...c, next_step: nextStep, key });\n}\n\n// Overdue throttling -- cap per run, drain gradually across runs.\nconst thisRun = due.slice(0, PER_RUN_CAP);\nreturn thisRun.map(d => ({ json: d }));\n"
+      },
+      "id": "15000001-0000-4000-8000-000000000002",
+      "name": "Find Due Contacts (capped, per-contact clock)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1380, 0]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "15000001-0000-4000-8000-000000000003",
+      "name": "One Contact At A Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-1160, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Deadline check (A8): no pre-submission email (E1-E4) fires after\n// the due date, checked before every send, same place the DNC check\n// sits.\nconst fs = require('fs');\nconst path = require('path');\nlet doc;\ntry { doc = JSON.parse(fs.readFileSync(path.join('Working', $json.project_prefix, 'project_document.json'), 'utf8')); } catch (e) {}\nconst expired = doc && doc.deadline && doc.deadline.due_date_parsed && new Date(doc.deadline.due_date_parsed).getTime() < Date.now();\nreturn [{ json: { ...$json, expired } }];\n"
+      },
+      "id": "15000001-0000-4000-8000-000000000004",
+      "name": "Deadline Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-940, -100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Conversion check: UNBUFFERED, LIVE, immediately pre-send -- never a\n// batch-load cache. Reads status fresh from disk right here, right now,\n// not from the list built at run-start (fixes the throttled-batch\n// staleness race).\n\nconst fs = require('fs');\nconst path = require('path');\n\nlet intakeLog = [];\ntry { intakeLog = JSON.parse(fs.readFileSync(path.join('Shared', 'intake_log.json'), 'utf8')); } catch (e) {}\n\nconst live = intakeLog.find(e => e.project_prefix === $json.project_prefix && e.email === $json.email);\nconst alreadyConverted = live && ['nda_signed', 'payment_confirmed'].includes(live.status);\n\n// E4 specifically targets non-NDA holdouts only, by design -- an\n// NDA-signed contact is correctly excluded here regardless of paid\n// status; their path is the Follow-up Watcher's payment-drop reminder.\nconst skip = $json.next_step === 'E4' ? (live && live.status !== undefined) : alreadyConverted;\n\nreturn [{ json: { ...$json, skip_send: !!skip } }];\n"
+      },
+      "id": "15000001-0000-4000-8000-000000000005",
+      "name": "Live Conversion Check (unbuffered)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-940, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Correction-queue check: before every send, checks the AI-corrected\n// contact overlay first; used in place of the original if present.\nconst fs = require('fs');\nconst path = require('path');\nlet corrections = [];\ntry { corrections = JSON.parse(fs.readFileSync(path.join('Working', $json.project_prefix, 'ai_corrected_contacts.json'), 'utf8')); } catch (e) {}\nconst match = corrections.find(c => c.original_email === $json.email);\nreturn [{ json: { ...$json, send_to_email: match ? match.corrected_email : $json.email } }];\n"
+      },
+      "id": "15000001-0000-4000-8000-000000000006",
+      "name": "Correction-Queue Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-940, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Global DNC check: fs.statSync, size (primary) + mtimeMs (secondary)\n// against last-seen. Either changing triggers a re-read. Checked\n// before every single send.\n\nconst fs = require('fs');\nconst path = require('path');\nconst crypto = require('crypto');\n\nconst dncPath = path.join('Shared', 'global_dnc.txt');\nconst stat = fs.statSync(dncPath);\n\nconst staticData = $getWorkflowStaticData('global');\nconst changed = staticData.dnc_size !== stat.size || staticData.dnc_mtime !== stat.mtimeMs;\n\nif (changed || !staticData.dnc_set) {\n  const lines = fs.readFileSync(dncPath, 'utf8').split('\\n').filter(Boolean);\n  staticData.dnc_set = lines;\n  staticData.dnc_size = stat.size;\n  staticData.dnc_mtime = stat.mtimeMs;\n}\n\nconst normalized = String($json.send_to_email).toLowerCase().trim().replace(/\\+.*@/, '@');\nconst hash = crypto.createHash('sha256').update(normalized).digest('hex');\nconst suppressed = staticData.dnc_set.includes(hash);\n\nreturn [{ json: { ...$json, dnc_suppressed: suppressed } }];\n"
+      },
+      "id": "15000001-0000-4000-8000-000000000007",
+      "name": "Global DNC Check (dual signal)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-720, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "15000001-0001-4000-8000-000000000010", "leftValue": "={{ $json.skip_send || $json.expired || $json.dnc_suppressed }}", "rightValue": false, "operator": { "type": "boolean", "operation": "false" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "15000001-0000-4000-8000-000000000008",
+      "name": "Clear to Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-500, 0]
+    },
+    {
+      "parameters": {
+        "fromEmail": "hello@circleofcareacademy.org",
+        "toEmail": "={{ $json.send_to_email }}",
+        "subject": "={{ $json.next_step }}",
+        "html": "={{ $now }}"
+      },
+      "id": "15000001-0000-4000-8000-000000000009",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [-280, -80]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\nlet sendLog = {};\ntry { sendLog = JSON.parse(fs.readFileSync(path.join('Shared', 'send_log.json'), 'utf8')); } catch (e) {}\nif (!sendLog[$json.key]) sendLog[$json.key] = {};\nsendLog[$json.key][$json.next_step] = { sent_at: new Date().toISOString(), confirmed: false };\nfs.writeFileSync(path.join('Shared', 'send_log.json'), JSON.stringify(sendLog, null, 2), 'utf8');\nreturn [{ json: $json }];\n"
+      },
+      "id": "15000001-0000-4000-8000-00000000000a",
+      "name": "Log Send (confirmed by Bounce Processor)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-60, -80]
+    },
+    {
+      "parameters": {},
+      "id": "15000001-0000-4000-8000-00000000000b",
+      "name": "Loop Back",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [-280, 100]
+    }
+  ],
+  "connections": {
+    "Daily 7:00 PM Operator Timezone": { "main": [[{ "node": "Find Due Contacts (capped, per-contact clock)", "type": "main", "index": 0 }]] },
+    "Find Due Contacts (capped, per-contact clock)": { "main": [[{ "node": "One Contact At A Time", "type": "main", "index": 0 }]] },
+    "One Contact At A Time": { "main": [[{ "node": "Deadline Check", "type": "main", "index": 0 }, { "node": "Live Conversion Check (unbuffered)", "type": "main", "index": 0 }, { "node": "Correction-Queue Check", "type": "main", "index": 0 }], []] },
+    "Deadline Check": { "main": [[{ "node": "Global DNC Check (dual signal)", "type": "main", "index": 0 }]] },
+    "Live Conversion Check (unbuffered)": { "main": [[{ "node": "Global DNC Check (dual signal)", "type": "main", "index": 0 }]] },
+    "Correction-Queue Check": { "main": [[{ "node": "Global DNC Check (dual signal)", "type": "main", "index": 0 }]] },
+    "Global DNC Check (dual signal)": { "main": [[{ "node": "Clear to Send?", "type": "main", "index": 0 }]] },
+    "Clear to Send?": { "main": [[{ "node": "Send Email", "type": "main", "index": 0 }], [{ "node": "Loop Back", "type": "main", "index": 0 }]] },
+    "Send Email": { "main": [[{ "node": "Log Send (confirmed by Bounce Processor)", "type": "main", "index": 0 }]] },
+    "Log Send (confirmed by Bounce Processor)": { "main": [[{ "node": "Loop Back", "type": "main", "index": 0 }]] },
+    "Loop Back": { "main": [[{ "node": "One Contact At A Time", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

@@ -1,0 +1,131 @@
+{
+  "name": "Circle of Care - 08 - Web Pipeline (NDA-Intake-Payment Webhook)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "intake-handler-prod",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "08000001-0000-4000-8000-000000000001",
+      "name": "Intake Webhook (raw body, static path)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1400, 0],
+      "webhookId": "intake-handler-prod",
+      "notes": "Static, user-defined path (Part D) -- never an auto-generated UUID, survives re-imports. rawBody:true -- JSON.parse happens explicitly downstream, inside our own try/catch, never n8n's implicit parser."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Two-layer validation (A9/A12). Layer 1: parse the raw body inside a\n// code-controlled try/catch, so a malformed payload throws inside code\n// we control, not n8n's own parsing layer.\n\nlet parsed;\ntry {\n  parsed = JSON.parse($json.body || '{}');\n} catch (e) {\n  return [{ json: { valid: false, status: 400, reason: 'malformed_json' } }];\n}\n\n// Project identifier validated against the active-project index BEFORE\n// any file path is ever constructed from it -- closes the\n// Working\\undefined\\schema.json class of failure.\nconst fs = require('fs');\nconst path = require('path');\nlet activeProjects = [];\ntry { activeProjects = JSON.parse(fs.readFileSync(path.join('Shared', 'processed_projects.json'), 'utf8')); } catch (e) {}\n\nconst prefix = parsed.project_prefix;\nif (!prefix || typeof prefix !== 'string' || !activeProjects.includes(prefix)) {\n  return [{ json: { valid: false, status: 400, reason: 'invalid_or_missing_project_prefix' } }];\n}\n\nreturn [{ json: { valid: true, project_prefix: prefix, payload: parsed } }];\n"
+      },
+      "id": "08000001-0000-4000-8000-000000000002",
+      "name": "Parse + Validate Project Identifier",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1180, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "08000001-0001-4000-8000-000000000010", "leftValue": "={{ $json.valid }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "08000001-0000-4000-8000-000000000003",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-960, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: $json.reason } }}",
+        "options": { "responseCode": 400 }
+      },
+      "id": "08000001-0000-4000-8000-000000000004",
+      "name": "Respond 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [-740, 120]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Schema read with retry-with-backoff -- tolerant of any transient\n// host-level file lock (antivirus sweep, indexing), never a single\n// unbuffered attempt (A9/A12).\nconst fs = require('fs');\nconst path = require('path');\nconst schemaPath = path.join('Working', $json.project_prefix, 'intake_schema.json');\n\nlet schema = null;\nlet lastErr = null;\nfor (let attempt = 0; attempt < 3; attempt++) {\n  try {\n    schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));\n    break;\n  } catch (e) {\n    lastErr = e;\n    const wait = 50 * (attempt + 1);\n    const start = Date.now();\n    while (Date.now() - start < wait) { /* brief spin, ~50-150ms total */ }\n  }\n}\n\nif (!schema) {\n  return [{ json: { valid: false, status: 400, reason: 'schema_unreadable_after_retry' } }];\n}\n\n// Validate submitted fields against the schema's allowlist -- alphanumeric\n// + underscore, 40-char cap, blocked from __proto__/constructor/prototype.\nconst BLOCKED = new Set(['__proto__', 'constructor', 'prototype']);\nconst submitted = Object.keys($json.payload.fields || {});\nconst schemaFields = new Set(schema.fields.map(f => f.name));\n\nfor (const key of submitted) {\n  if (BLOCKED.has(key) || !schemaFields.has(key)) {\n    return [{ json: { valid: false, status: 400, reason: 'field_not_in_schema: ' + key } }];\n  }\n}\n\nreturn [{ json: { valid: true, project_prefix: $json.project_prefix, payload: $json.payload } }];\n"
+      },
+      "id": "08000001-0000-4000-8000-000000000005",
+      "name": "Validate Against Dynamic Schema",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-740, -120]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "08000001-0002-4000-8000-000000000011", "leftValue": "={{ $json.valid }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "08000001-0000-4000-8000-000000000006",
+      "name": "Schema Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-520, -120]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per-contact-hash lock file (A12). Concurrent request finding a live\n// lock aborts rather than racing. Heartbeat-refreshed elsewhere by the\n// background job; here we only create/check it.\nconst fs = require('fs');\nconst path = require('path');\nconst crypto = require('crypto');\n\nconst email = ($json.payload.fields && $json.payload.fields.email) || '';\nconst hash = crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex');\nconst lockPath = path.join('Working', $json.project_prefix, 'locks', hash + '.lock');\nfs.mkdirSync(path.dirname(lockPath), { recursive: true });\n\nif (fs.existsSync(lockPath)) {\n  const stat = fs.statSync(lockPath);\n  const staleMs = Date.now() - stat.mtimeMs;\n  if (staleMs < 5 * 60 * 1000) {\n    return [{ json: { locked: true } }];\n  }\n}\n\nfs.writeFileSync(lockPath, String(Date.now()), 'utf8');\nreturn [{ json: { locked: false, contact_hash: hash, project_prefix: $json.project_prefix, payload: $json.payload } }];\n"
+      },
+      "id": "08000001-0000-4000-8000-000000000007",
+      "name": "Duplicate-Submission Lock",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-300, -120]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'accepted' } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "08000001-0000-4000-8000-000000000008",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [-80, -220],
+      "notes": "Decoupling law: 200 returns immediately after validation passes. Everything heavy -- PDF generation, correction-queue copy, downstream processing -- forks to background from here."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Copies the validated, completed submission from public_html/intake_cache/\n// into the protected Working\\ path -- the one and only crossing point\n// from public to backend (A9/A12).\nconst fs = require('fs');\nconst path = require('path');\nconst dest = path.join('Working', $json.project_prefix, 'intake_submissions', $json.contact_hash + '.json');\nfs.mkdirSync(path.dirname(dest), { recursive: true });\nfs.writeFileSync(dest, JSON.stringify($json.payload, null, 2), 'utf8');\nreturn [{ json: $json }];\n"
+      },
+      "id": "08000001-0000-4000-8000-000000000009",
+      "name": "Copy Into Working (background)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-80, -20]
+    }
+  ],
+  "connections": {
+    "Intake Webhook (raw body, static path)": { "main": [[{ "node": "Parse + Validate Project Identifier", "type": "main", "index": 0 }]] },
+    "Parse + Validate Project Identifier": { "main": [[{ "node": "Valid?", "type": "main", "index": 0 }]] },
+    "Valid?": { "main": [[{ "node": "Validate Against Dynamic Schema", "type": "main", "index": 0 }], [{ "node": "Respond 400", "type": "main", "index": 0 }]] },
+    "Validate Against Dynamic Schema": { "main": [[{ "node": "Schema Valid?", "type": "main", "index": 0 }]] },
+    "Schema Valid?": { "main": [[{ "node": "Duplicate-Submission Lock", "type": "main", "index": 0 }], [{ "node": "Respond 400", "type": "main", "index": 0 }]] },
+    "Duplicate-Submission Lock": { "main": [[{ "node": "Respond 200 OK", "type": "main", "index": 0 }, { "node": "Copy Into Working (background)", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

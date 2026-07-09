@@ -1,0 +1,52 @@
+{
+  "name": "Circle of Care - 18 - LinkedIn Token Refresh",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "hours", "hoursInterval": 1 }] } },
+      "id": "18000001-0000-4000-8000-000000000001",
+      "name": "Hourly (independent of AI queue)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-900, 0],
+      "notes": "Not an AI job -- never touches the concurrency=1 slot (A14). Standalone, low-cost, doesn't compete with inference work."
+    },
+    {
+      "parameters": {
+        "url": "https://www.linkedin.com/oauth/v2/accessToken",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "grant_type", "value": "refresh_token" },
+            { "name": "refresh_token", "value": "={{ $env.LINKEDIN_REFRESH_TOKEN }}" },
+            { "name": "client_id", "value": "={{ $env.LINKEDIN_CLIENT_ID }}" },
+            { "name": "client_secret", "value": "={{ $env.LINKEDIN_CLIENT_SECRET }}" }
+          ]
+        },
+        "options": { "timeout": 15000 }
+      },
+      "id": "18000001-0000-4000-8000-000000000002",
+      "name": "Rotate Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-680, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Writes to a PLAIN FILE, never process.env or n8n's canvas store --\n// a long-running process's env snapshot isn't guaranteed to reflect a\n// value written after startup. Downstream nodes (Carousel Builder) do\n// a direct fs.readFileSync at execution time, always current, never\n// dependent on n8n's in-memory state surviving a Git re-import.\n\nconst fs = require('fs');\nconst path = require('path');\n\nif (!$json.access_token) {\n  return [{ json: { rotated: false, reason: 'no_access_token_in_response' } }];\n}\n\nfs.writeFileSync(path.join('Shared', 'linkedin_token.txt'), $json.access_token, 'utf8');\n\nreturn [{ json: { rotated: true, rotated_at: new Date().toISOString() } }];\n"
+      },
+      "id": "18000001-0000-4000-8000-000000000003",
+      "name": "Write to Plain File (not $env)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-460, 0]
+    }
+  ],
+  "connections": {
+    "Hourly (independent of AI queue)": { "main": [[{ "node": "Rotate Token", "type": "main", "index": 0 }]] },
+    "Rotate Token": { "main": [[{ "node": "Write to Plain File (not $env)", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}

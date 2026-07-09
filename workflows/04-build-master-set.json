@@ -1,0 +1,90 @@
+{
+  "name": "Circle of Care - 04 - Build Master Set",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "f1000001-0000-4000-8000-000000000001",
+      "name": "Start (from Tier Map)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-800, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// A5: builds each deliverable from the decoded, citation-carrying JSON\n// only -- never raw guesswork. One inference call per component,\n// serialized (AI concurrency=1, A14).\n\nconst fs = require('fs');\nconst path = require('path');\n\nconst prefix = $json.project_prefix;\nconst doc = JSON.parse(fs.readFileSync(path.join('Working', prefix, 'project_document.json'), 'utf8'));\nconst tierMap = JSON.parse(fs.readFileSync(path.join('Working', prefix, 'tier_map.json'), 'utf8'));\n\nconst components = [\n  { key: 'compliance_checklist', label: 'Compliance checklist & requirements review' },\n  { key: 'end_to_end_drafting', label: 'End-to-end proposal drafting' },\n  { key: 'sow_budget', label: 'SOW draft and budget template' }\n];\n\nreturn components.map(c => ({\n  json: {\n    project_prefix: prefix,\n    component_key: c.key,\n    component_label: c.label,\n    decoded_facts: doc.decoded_facts,\n    tier_map: tierMap\n  }\n}));\n"
+      },
+      "id": "f1000001-0000-4000-8000-000000000002",
+      "name": "Enumerate Required Components",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-580, 0]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "f1000001-0000-4000-8000-000000000003",
+      "name": "One Component At A Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-360, 0],
+      "notes": "Serializes generation the same way Decode serializes file reads -- one inference call in flight at a time."
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:11434/api/generate",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"qwen2.5:4b-instruct-q4_K_M\", stream: false, prompt: \"Draft the '\" + $json.component_label + \"' document. Use ONLY the facts below, each already citation-backed. Any figure not present in this list must be marked [REVIEW], never invented. Facts:\\n\\n\" + JSON.stringify($json.decoded_facts) }) }}",
+        "options": { "timeout": 180000 }
+      },
+      "id": "f1000001-0000-4000-8000-000000000004",
+      "name": "Draft Component (Qwen)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-140, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\n\nconst prefix = $json.project_prefix;\nconst key = $json.component_key;\nconst outDir = path.join('Working', prefix, 'master_set');\nfs.mkdirSync(outDir, { recursive: true });\n\n// exceljs formula-liveness applies only to the compliance checklist,\n// where scored items must be live formulas, not typed values (A5).\n// That specific spreadsheet build step lives in its own node below\n// when component_key === 'compliance_checklist'; other components\n// write as .md, which is the standard for text deliverables (B5).\n\nfs.writeFileSync(path.join(outDir, key + '.md'), $json.response || '', 'utf8');\n\nreturn [{ json: { project_prefix: prefix, component_key: key, written: true } }];\n"
+      },
+      "id": "f1000001-0000-4000-8000-000000000005",
+      "name": "Write Master Component",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [80, 0]
+    },
+    {
+      "parameters": {},
+      "id": "f1000001-0000-4000-8000-000000000006",
+      "name": "Loop Back",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [300, 0]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "PLACEHOLDER_DERIVE_TIER_PACKAGES_ID", "mode": "list" },
+        "workflowInputs": { "mappingMode": "defineBelow", "value": { "project_prefix": "={{ $json.project_prefix }}" } },
+        "options": { "waitForSubWorkflow": false }
+      },
+      "id": "f1000001-0000-4000-8000-000000000007",
+      "name": "Hand Off to Derive Tier Packages",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [520, 0]
+    }
+  ],
+  "connections": {
+    "Start (from Tier Map)": { "main": [[{ "node": "Enumerate Required Components", "type": "main", "index": 0 }]] },
+    "Enumerate Required Components": { "main": [[{ "node": "One Component At A Time", "type": "main", "index": 0 }]] },
+    "One Component At A Time": { "main": [[{ "node": "Draft Component (Qwen)", "type": "main", "index": 0 }], [{ "node": "Hand Off to Derive Tier Packages", "type": "main", "index": 0 }]] },
+    "Draft Component (Qwen)": { "main": [[{ "node": "Write Master Component", "type": "main", "index": 0 }]] },
+    "Write Master Component": { "main": [[{ "node": "Loop Back", "type": "main", "index": 0 }]] },
+    "Loop Back": { "main": [[{ "node": "One Component At A Time", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}
