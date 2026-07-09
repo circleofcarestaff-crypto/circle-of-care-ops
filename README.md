@@ -52,6 +52,12 @@ None of these can be created by an automated script — each requires a human ac
 - Client data, contact lists, or anything project-specific. Those live in `Working\` on the server, isolated per project, and are never committed.
 - The actual n8n instance. This repo is the specification and the workflow definitions; the running system is a separate thing that imports from here.
 
+## Import gotchas (hit once on this deployment, documented so it isn't hit twice)
+
+- **Every workflow JSON must have a top-level `id` field.** Without one, `n8n import:workflow` throws `null value in column "id" of relation "workflow_entity" violates not-null constraint` — this n8n version doesn't auto-generate one before insert. All files in `workflows/` carry a fixed UUID `id` for this reason.
+- **Files must be UTF-8 without a BOM.** Editing these files with Windows PowerShell's `Set-Content -Encoding utf8` silently prepends a UTF-8 BOM (`EF BB BF`). n8n's JSON parser rejects it with `Unexpected token`. If re-editing on Windows, write with `[System.Text.UTF8Encoding]::new($false)` or verify with `xxd file.json | head -1` that it starts with `7b` (`{`), not `ef bb bf`.
+- **The n8n container is named `n8n-n8n-1`, not `n8n`** on this deployment (docker-compose naming: `<project>-<service>-<replica>`). `docker exec n8n ...` against the wrong name fails or silently no-ops.
+
 ## Placeholder workflow IDs
 
 Several workflow files reference `PLACEHOLDER_*_WORKFLOW_ID` in their `executeWorkflow` nodes. These get filled in with real internal IDs once both the calling and called workflows exist inside the same n8n instance — that's a wiring step done after import, not something fakeable in a file that hasn't been imported anywhere yet.
